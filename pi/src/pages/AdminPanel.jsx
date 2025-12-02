@@ -1,7 +1,9 @@
-import { useEffect, useState } from "react";
+import { useEffect, useState, useRef } from "react";
 import { useNavigate } from "react-router-dom";
 import BackButton from "../components/BackButton";
 import { supabase } from "../service/supabase.js";
+
+const STORAGE_BUCKET = import.meta.env.VITE_SUPABASE_BUCKET ?? "produto-imagens";
 
 export default function AdminPanel() {
 	// carregar produtos do banco em vez de usar dados estáticos
@@ -48,9 +50,21 @@ export default function AdminPanel() {
 	const [novoPreco, setNovoPreco] = useState("");
 	const [novoCategoria, setNovoCategoria] = useState("bebidas");
 	const [novaDescricao, setNovaDescricao] = useState("");
+	const [novaImagem, setNovaImagem] = useState(null);
+	const [imagemPreviewUrl, setImagemPreviewUrl] = useState(null);
+	const [uploadedImageUrl, setUploadedImageUrl] = useState(null);
 	const [loadingAdd, setLoadingAdd] = useState(false);
 	const [loadingRemoveId, setLoadingRemoveId] = useState(null);
+	const fileInputRef = useRef(null);
 	const navigate = useNavigate();
+
+	useEffect(() => {
+		return () => {
+			if (imagemPreviewUrl) {
+				URL.revokeObjectURL(imagemPreviewUrl);
+			}
+		};
+	}, [imagemPreviewUrl]);
 
 	// helper para formatar erros em string legível
 	const formatError = (err) => {
@@ -73,6 +87,40 @@ export default function AdminPanel() {
 			// ignore
 		}
 		return "Erro desconhecido";
+	};
+
+	const generateFilePath = (userId, fileExtension) => {
+		const sanitizedExt = (fileExtension || "png").replace(/[^a-zA-Z0-9]/g, "") || "png";
+		const randomPart =
+			typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
+				? crypto.randomUUID()
+				: Math.random().toString(36).slice(2, 10);
+		return `${userId || "anon"}/${Date.now()}-${randomPart}.${sanitizedExt}`;
+	};
+
+	const uploadProductImage = async (file, userId) => {
+		if (!file) return null;
+		const fileExt = file.name?.split(".").pop();
+		const objectPath = generateFilePath(userId, fileExt);
+		const { error: uploadError } = await supabase.storage
+			.from(STORAGE_BUCKET)
+			.upload(objectPath, file, {
+				cacheControl: "3600",
+				upsert: false,
+				contentType: file.type || "image/png",
+			});
+		if (uploadError) throw uploadError;
+		const { data } = supabase.storage.from(STORAGE_BUCKET).getPublicUrl(objectPath);
+		return {
+			path: objectPath,
+			publicUrl: data?.publicUrl ?? null,
+		};
+	};
+
+	const includesImagemColumnError = (supabaseError) => {
+		if (!supabaseError) return false;
+		const summary = `${supabaseError.message ?? ""} ${supabaseError.details ?? ""}`.toLowerCase();
+		return summary.includes("imagem_") || summary.includes("imagem ") || supabaseError.code === "42703";
 	};
 
 	const handleAddProduto = async (e) => {
@@ -115,74 +163,121 @@ export default function AdminPanel() {
 		}
 
 		// preco numérico vindo do campo
-	const precoNumerico = precoNum;
-	const valorCalculado = `R$ ${precoNumerico.toFixed(2).replace(".", ",")}`;
+		const precoNumerico = precoNum;
+		const valorCalculado = `R$ ${precoNumerico.toFixed(2).replace(".", ",")}`;
 
 		try {
-			setLoadingAdd(true);
+				setUploadedImageUrl(null);
+				setLoadingAdd(true);
 
-			// payload incluindo created_by obrigatório para a policy insertProduto
-			const payloadWithOwner = {
-				nome_produto: novoProduto,
-				descricao: novaDescricao,
-				categoria: novoCategoria,
-				preco: precoNumerico,
-				created_by: sessionUser.id, // enviado sempre
-			};
-
-			// tenta inserir e retorna a linha inserida
-			console.debug("Tentando INSERT produto com payload:", payloadWithOwner);
-			const res = await supabase
-				.from("produto")
-				.insert([payloadWithOwner])
-				.select("*")
-				.single();
-
-			if (res.error) {
-				// erro no insert
-				console.error("Insert error:", res.error);
-				const errMsg = formatError ? formatError(res.error) : (res.error?.message ?? JSON.stringify(res.error));
-				// detectar RLS e indicar policy insertProduto
-				const isRls = String(errMsg).toLowerCase().includes("row-level") || String(errMsg).toLowerCase().includes("row level");
-				if (isRls) {
-					alert(
-						"Inserção bloqueada por Row Level Security (policy: insertProduto).\n" +
-						"Verifique no Supabase Console se a policy 'insertProduto' permite INSERT com created_by = auth.uid().\n\n" +
-						"Erro: " + errMsg
-					);
-				} else {
-					alert("Erro ao salvar produto: " + errMsg);
+				let imagemInfo = null;
+				if (novaImagem) {
+					try {
+						imagemInfo = await uploadProductImage(novaImagem, sessionUser.id);
+					} catch (uploadErr) {
+						console.error("Erro ao enviar imagem para o Storage:", uploadErr);
+						alert("Não foi possível enviar a imagem. Tente novamente ou selecione outro arquivo.");
+						return;
+					}
 				}
-				return;
-			}
 
-			const insertedRow = res.data;
-			console.debug("Insert sucessful, row:", insertedRow);
+				// payload incluindo created_by obrigatório para a policy insertProduto
+				const payloadWithOwner = {
+					nome_produto: novoProduto,
+					descricao: novaDescricao,
+					categoria: novoCategoria,
+					preco: precoNumerico,
+					created_by: sessionUser.id, // enviado sempre
+				};
 
-			// mapear id corretamente: sua tabela usa id_produto
-			const idProduto = insertedRow?.id_produto ?? insertedRow?.id ?? null;
+				if (imagemInfo?.publicUrl) {
+					payloadWithOwner.imagem_url = imagemInfo.publicUrl;
+				} else if (imagemInfo?.path) {
+					payloadWithOwner.imagem_path = imagemInfo.path;
+				}
 
-			const inserted = {
-				id_produto: idProduto,
-				produto: insertedRow?.nome_produto ?? novoProduto,
-				valor:
-					typeof insertedRow?.preco === "number"
-						? `R$ ${insertedRow.preco.toFixed(2).replace(".", ",")}`
-						: valorCalculado,
-				descricao: insertedRow?.descricao ?? novaDescricao,
-				categoria: insertedRow?.categoria ?? novoCategoria,
-				// nao armazenamos quantidade aqui; mostramos apenas o valor
-			};
+				const attemptInsert = async (payload) =>
+					supabase
+						.from("produto")
+						.insert([payload])
+						.select("*")
+						.single();
 
-			setEntradas((prev) => [...prev, inserted]);
+				console.debug("Tentando INSERT produto com payload:", payloadWithOwner);
+				let res = await attemptInsert(payloadWithOwner);
 
-			// cleanup
-			setNovoProduto("");
-			setNovoPreco("");
-			setNovoCategoria("bebidas");
-			setNovaDescricao("");
-			setShowModal(false);
-		} catch (err) {
+				if (res.error && imagemInfo && includesImagemColumnError(res.error)) {
+					console.warn(
+						"A coluna para armazenar a URL da imagem parece não existir. Tentando salvar o produto sem o campo imagem.",
+						res.error
+					);
+					const fallbackPayload = { ...payloadWithOwner };
+					delete fallbackPayload.imagem_url;
+					delete fallbackPayload.imagem_path;
+					res = await attemptInsert(fallbackPayload);
+					if (!res.error) {
+						alert(
+							"Imagem enviada ao Storage, mas a tabela 'produto' não possui uma coluna para salvar a URL. Adicione uma coluna (por exemplo, imagem_url TEXT) para armazenar o link no banco."
+						);
+					}
+				}
+
+				if (res.error) {
+					// erro no insert
+					console.error("Insert error:", res.error);
+					const errMsg = formatError ? formatError(res.error) : (res.error?.message ?? JSON.stringify(res.error));
+					// detectar RLS e indicar policy insertProduto
+					const isRls = String(errMsg).toLowerCase().includes("row-level") || String(errMsg).toLowerCase().includes("row level");
+					if (isRls) {
+						alert(
+							"Inserção bloqueada por Row Level Security (policy: insertProduto).\n" +
+							"Verifique no Supabase Console se a policy 'insertProduto' permite INSERT com created_by = auth.uid().\n\n" +
+							"Erro: " + errMsg
+						);
+					} else {
+						alert("Erro ao salvar produto: " + errMsg);
+					}
+					return;
+				}
+
+				const insertedRow = res.data;
+				console.debug("Insert sucessful, row:", insertedRow);
+
+				// mapear id corretamente: sua tabela usa id_produto
+				const idProduto = insertedRow?.id_produto ?? insertedRow?.id ?? null;
+
+				const inserted = {
+					id_produto: idProduto,
+					produto: insertedRow?.nome_produto ?? novoProduto,
+					valor:
+						typeof insertedRow?.preco === "number"
+							? `R$ ${insertedRow.preco.toFixed(2).replace(".", ",")}`
+							: valorCalculado,
+					descricao: insertedRow?.descricao ?? novaDescricao,
+					categoria: insertedRow?.categoria ?? novoCategoria,
+					imagem_url: imagemInfo?.publicUrl ?? null,
+					imagem_path: imagemInfo?.path ?? null,
+					// nao armazenamos quantidade aqui; mostramos apenas o valor
+				};
+
+				setEntradas((prev) => [...prev, inserted]);
+
+				if (imagemInfo?.publicUrl) {
+					setUploadedImageUrl(imagemInfo.publicUrl);
+				}
+
+				// cleanup
+				setNovoProduto("");
+				setNovoPreco("");
+				setNovoCategoria("bebidas");
+				setNovaDescricao("");
+				setNovaImagem(null);
+				setImagemPreviewUrl(null);
+				if (fileInputRef.current) {
+					fileInputRef.current.value = "";
+				}
+				setShowModal(false);
+			} catch (err) {
 			console.error("Erro inesperado ao salvar produto:", err);
 			const errMsg = formatError ? formatError(err) : (err?.message ?? JSON.stringify(err));
 			alert("Erro inesperado ao salvar produto: " + errMsg);
@@ -322,6 +417,43 @@ export default function AdminPanel() {
 								onChange={(e) => setNovaDescricao(e.target.value)}
 								className="border p-2 rounded focus:outline-none focus:ring-2 focus:ring-[#6b4f4f]"
 							/>
+							<label className="text-sm text-[#6b4f4f] flex flex-col gap-2">
+								<span>Imagem do produto (opcional)</span>
+								<input
+									type="file"
+									accept="image/*"
+									ref={fileInputRef}
+									onChange={(e) => {
+										const file = e.target.files?.[0] ?? null;
+										setNovaImagem(file);
+										if (file) {
+											setImagemPreviewUrl(URL.createObjectURL(file));
+										} else {
+											setImagemPreviewUrl(null);
+										}
+									}}
+									className="border p-2 rounded focus:outline-none focus:ring-2 focus:ring-[#6b4f4f]"
+								/>
+							</label>
+							{imagemPreviewUrl && (
+								<div className="flex flex-col gap-2">
+									<span className="text-xs text-[#6b4f4f]">Pré-visualização:</span>
+									<img src={imagemPreviewUrl} alt="Prévia do produto" className="w-full h-32 object-cover rounded border" />
+								</div>
+							)}
+							{uploadedImageUrl && (
+								<p className="text-xs text-green-700 break-all">
+									Última imagem enviada:
+									<a
+										href={uploadedImageUrl}
+										target="_blank"
+										rel="noreferrer"
+										className="underline ml-1"
+									>
+										abrir
+									</a>
+								</p>
+							)}
 							<select
 								value={novoCategoria}
 								onChange={(e) => setNovoCategoria(e.target.value)}
@@ -331,13 +463,20 @@ export default function AdminPanel() {
 								<option value="cafe">Café</option>
 								<option value="doces">Doces</option>
 								<option value="chas">Chás</option>
-								<option value="salgados">Salgados</option>,
-								
+								<option value="salgados">Salgados</option>
 							</select>
 							<div className="flex justify-end gap-2">
 								<button
 									type="button"
-									onClick={() => setShowModal(false)}
+									onClick={() => {
+										setShowModal(false);
+										setNovaImagem(null);
+										setImagemPreviewUrl(null);
+										setUploadedImageUrl(null);
+										if (fileInputRef.current) {
+											fileInputRef.current.value = "";
+										}
+									}}
 									className="px-4 py-2 rounded bg-gray-300 hover:bg-gray-400"
 								>
 									Cancelar

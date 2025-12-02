@@ -20,7 +20,7 @@ export default function Cafe() {
         setLoading(true);
         const { data, error } = await supabase
           .from("produto")
-          .select("id_produto, nome_produto, descricao, preco, created_at, categoria")
+          .select("id_produto, nome_produto, descricao, preco, created_at, categoria, imagem_url")
           .eq("categoria", "cafe")
           .order("created_at", { ascending: false });
         if (error) {
@@ -34,7 +34,7 @@ export default function Cafe() {
           nome: r.nome_produto ?? "Produto",
           preco: typeof r.preco === "number" ? r.preco : parseFloat(String(r.preco ?? "0").replace(",", ".")) || 0,
           descricao: r.descricao ?? "",
-          imagem: placeholderImg,
+          imagem: r.imagem_url || placeholderImg,
         }));
 
         setProdutos(mapped);
